@@ -28,13 +28,13 @@ static void *cryptoDlOpen(sqlite3_vfs *vfs, const char *zPath) {
 	return ORIGVFS(vfs)->xDlOpen(ORIGVFS(vfs), zPath);
 }
 static void cryptoDlError(sqlite3_vfs *vfs, int nByte, char *zErrMsg){
-  ORIGVFS(vfs)->xDlError(ORIGVFS(vfs), nByte, zErrMsg);
+	ORIGVFS(vfs)->xDlError(ORIGVFS(vfs), nByte, zErrMsg);
 }
 static void (*cryptoDlSym(sqlite3_vfs *vfs, void *p, const char *zSym))(void) {
 	return ORIGVFS(vfs)->xDlSym(ORIGVFS(vfs), p, zSym);
 }
 static void cryptoDlClose(sqlite3_vfs *vfs, void *pHandle){
-  ORIGVFS(vfs)->xDlClose(ORIGVFS(vfs), pHandle);
+	ORIGVFS(vfs)->xDlClose(ORIGVFS(vfs), pHandle);
 }
 static int cryptoRandomness(sqlite3_vfs *vfs, int nByte, char *zBufOut) {
 	return ORIGVFS(vfs)->xRandomness(ORIGVFS(vfs), nByte, zBufOut);
@@ -99,5 +99,9 @@ int sqlite3_cryptovfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routi
 	crypto_vfs.iVersion = pOrig->iVersion;
 	crypto_vfs.pAppData = pOrig;
 	crypto_vfs.szOsFile = sizeof(encrypted_file) + pOrig->szOsFile;
-	return sqlite3_vfs_register(&crypto_vfs, 0);
+	int rc = sqlite3_vfs_register(&crypto_vfs, 1);
+	if (rc == SQLITE_OK) {
+		rc = SQLITE_OK_LOAD_PERMANENTLY;
+	}
+	return rc;
 }

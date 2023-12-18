@@ -1,3 +1,4 @@
+# build files
 build/
 *.o
 *.obj
@@ -7,3 +8,9 @@ build/
 *.dll
 *.so
 *.dylib
+
+# other caches
+.cache
+
+# test databases
+*.db
