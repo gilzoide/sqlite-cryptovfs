@@ -1,0 +1,1 @@
+#define ORIGVFS(p)  ((sqlite3_vfs *) (p)->pAppData)
