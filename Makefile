@@ -4,17 +4,13 @@ BUILD_DIRS = \
 $(BUILD_DIRS):
 	mkdir -p $@
 
-build/%/cryptofile.o: src/cryptofile.c | build/%
-	$(CC) -o $@ -c $< $(CFLAGS)
-build/%/cryptovfs.o: src/cryptovfs.c | build/%
-	$(CC) -o $@ -c $< $(CFLAGS)
-.PRECIOUS: build/%/cryptofile.o build/%/cryptovfs.o
+build/%/cryptovfs.dylib: CFLAGS += $(shell pkg-config --cflags libsodium)
+build/%/cryptovfs.dylib: LINKFLAGS += -shared -lsqlite3 $(shell pkg-config --variable=libdir libsodium)/libsodium.a
+build/%/cryptovfs.dylib: src/cryptovfs.c | build/%
+	$(CC) -o $@ $< $(CFLAGS) $(LINKFLAGS)
 
-build/%/libcryptovfs.dylib: LINKFLAGS += -shared -lsqlite3
-build/%/libcryptovfs.dylib: build/%/cryptofile.o build/%/cryptovfs.o
-	$(CC) -o $@ $^ $(CFLAGS) $(LINKFLAGS)
-
+# build/sqlite3crypto: 
 
 # Targets
-macos-universal: CFLAGS += -arch x86_64 -arch arm64
-macos-universal: build/macos/libcryptovfs.dylib
+macos-universal: CFLAGS += -arch arm64
+macos-universal: build/macos/cryptovfs.dylib
