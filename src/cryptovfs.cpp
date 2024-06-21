@@ -1,14 +1,46 @@
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <sodium.h>
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT1
 
+// SQLite file format offsets
+#define SQLITE_FORMAT_PAGE_SIZE_OFFSET 16
+#define SQLITE_FORMAT_RESERVED_BYTES_OFFSET 20
+#define SQLITE_FORMAT_HEADER_SIZE 100
+
+// Helper macros for byte/math operations
+#define LOAD_8(p) \
+	(((uint8_t *) p)[0])
+#define LOAD_16_BE(p) \
+	(((uint8_t *) p)[0] << 8) + (((uint8_t *) p)[1])
+#define MIN(a, b) \
+	((a) < (b) ? (a) : (b))
+#define MAX(a, b) \
+	((a) > (b) ? (a) : (b))
+
+#define CRYPTO_RESERVED_BYTES \
+	MAX(crypto_secretstream_xchacha20poly1305_HEADERBYTES, crypto_secretstream_xchacha20poly1305_ABYTES)
+
+
+
+
 typedef struct encrypted_file {
 	sqlite3_file base;
+	int page_size;
+	int reserved_bytes;
 	sqlite3_file original_file[0];
 } encrypted_file;
 
 #define ORIGVFS(p)  ((sqlite3_vfs *) (p)->pAppData)
 #define ORIGFILE(p)  (((encrypted_file *) (p))->original_file)
+
+typedef struct file_control_pragma {
+	char *result;
+	const char *name;
+	const char *argument;
+} file_control_pragma;
 
 ///////////////////////////////////////////////////////////
 // File implementation
@@ -18,21 +50,46 @@ static int cryptoFileControl(sqlite3_file *pFile, int op, void *pArg) {
 		case SQLITE_FCNTL_VFSNAME:
 			*(char **) pArg = sqlite3_mprintf("%z", "cryptovfs");
 			return SQLITE_OK;
+
+		case SQLITE_FCNTL_OVERWRITE:
+			printf("Overwriting!\n");
+			break;
+		
+		case SQLITE_FCNTL_PRAGMA: {
+			file_control_pragma *pragma_args = (file_control_pragma *) pArg;
+			if (sqlite3_stricmp(pragma_args->name, "key") == 0 || sqlite3_stricmp(pragma_args->name, "textkey") == 0) {
+				printf("GOT PRAGMA KEY\n");
+			}
+			break;
+		}
 		
 		default:
-			return ORIGFILE(pFile)->pMethods->xFileControl(ORIGFILE(pFile), op, pArg);
+			break;
 	}
+	return ORIGFILE(pFile)->pMethods->xFileControl(ORIGFILE(pFile), op, pArg);
 }
 
-// All other file methods are pass-thrus
-static int cryptoClose(sqlite3_file *pFile) {
-	return ORIGFILE(pFile)->pMethods->xClose(ORIGFILE(pFile));
-}
 static int cryptoRead(sqlite3_file *pFile, void *zBuf, int iAmt, sqlite_int64 iOfst) {
+	printf("READ %d from %lli\n", iAmt, iOfst);
 	return ORIGFILE(pFile)->pMethods->xRead(ORIGFILE(pFile), zBuf, iAmt, iOfst);
 }
 static int cryptoWrite(sqlite3_file *pFile, const void *zBuf, int iAmt, sqlite_int64 iOfst) {
+	printf("WRITE %d from %lli\n", iAmt, iOfst);
+	if (iOfst == 0 && iAmt >= SQLITE_FORMAT_HEADER_SIZE) {
+		encrypted_file *file = (encrypted_file *) pFile;
+		file->reserved_bytes = LOAD_8(zBuf + SQLITE_FORMAT_RESERVED_BYTES_OFFSET);
+		file->page_size = LOAD_16_BE(zBuf + SQLITE_FORMAT_PAGE_SIZE_OFFSET);
+		if (file->page_size == 1) {
+			file->page_size = 65536;
+		}
+		printf("RESERVED @ WRITE: %d\n", file->reserved_bytes);
+		printf("PAGE SIZE @ WRITE: %d\n", file->page_size);
+	}
 	return ORIGFILE(pFile)->pMethods->xWrite(ORIGFILE(pFile), zBuf, iAmt, iOfst);
+}
+// All other file methods are pass-thrus
+static int cryptoClose(sqlite3_file *pFile) {
+	return ORIGFILE(pFile)->pMethods->xClose(ORIGFILE(pFile));
 }
 static int cryptoTruncate(sqlite3_file *pFile, sqlite_int64 size) {
 	return ORIGFILE(pFile)->pMethods->xTruncate(ORIGFILE(pFile), size);
@@ -82,7 +139,10 @@ static int cryptoUnfetch(sqlite3_file *pFile, sqlite3_int64 iOfst, void *pPage) 
 // VFS implementation
 ///////////////////////////////////////////////////////////
 static int cryptoOpen(sqlite3_vfs *vfs, const char *zName, sqlite3_file *pFile, int flags, int *pOutFlags) {
-	int rc = ORIGVFS(vfs)->xOpen(ORIGVFS(vfs), zName, ORIGFILE(pFile), flags, pOutFlags);
+	sqlite3_vfs *original_vfs = ORIGVFS(vfs);
+	sqlite3_file *original_file = ORIGFILE(pFile);
+
+	int rc = original_vfs->xOpen(original_vfs, zName, original_file, flags, pOutFlags);
 	if (rc != SQLITE_OK) {
 		return rc;
 	}
@@ -109,9 +169,8 @@ static int cryptoOpen(sqlite3_vfs *vfs, const char *zName, sqlite3_file *pFile, 
 		cryptoUnfetch,                  /* xUnfetch */
 	};
 	encrypted_file *file = (encrypted_file *) pFile;
-	io_methods.iVersion = ORIGFILE(file)->pMethods->iVersion;
+	io_methods.iVersion = original_file->pMethods->iVersion;
 	file->base.pMethods = &io_methods;
-	
 	return rc;
 }
 
@@ -162,36 +221,70 @@ static const char *cryptoNextSystemCall(sqlite3_vfs *vfs, const char *zName) {
 	return ORIGVFS(vfs)->xNextSystemCall(ORIGVFS(vfs), zName);
 }
 
+static sqlite3_vfs crypto_vfs = {
+	3,                            /* iVersion (set when registered) */
+	0,                            /* szOsFile (set when registered) */
+	1024,                         /* mxPathname */
+	0,                            /* pNext */
+	"cryptovfs",                  /* zName */
+	0,                            /* pAppData (set when registered) */ 
+	cryptoOpen,                   /* xOpen */
+	cryptoDelete,                 /* xDelete */
+	cryptoAccess,                 /* xAccess */
+	cryptoFullPathname,           /* xFullPathname */
+	cryptoDlOpen,                 /* xDlOpen */
+	cryptoDlError,                /* xDlError */
+	cryptoDlSym,                  /* xDlSym */
+	cryptoDlClose,                /* xDlClose */
+	cryptoRandomness,             /* xRandomness */
+	cryptoSleep,                  /* xSleep */
+	cryptoCurrentTime,            /* xCurrentTime */
+	cryptoGetLastError,           /* xGetLastError */
+	cryptoCurrentTimeInt64,       /* xCurrentTimeInt64 */
+	cryptoSetSystemCall,          /* xSetSystemCall */
+	cryptoGetSystemCall,          /* xGetSystemCall */
+	cryptoNextSystemCall,         /* xNextSystemCall */
+};
+
+static int xEntryPoint(sqlite3 *db, const char **pzErrMsg, const struct sqlite3_api_routines *pThunk) {
+	int rc = SQLITE_OK;
+	sqlite3_vfs *vfs;
+	if (sqlite3_file_control(db, NULL, SQLITE_FCNTL_VFS_POINTER, &vfs) == SQLITE_OK
+		&& vfs == &crypto_vfs)
+	{
+		encrypted_file *file;
+		if (sqlite3_file_control(db, NULL, SQLITE_FCNTL_FILE_POINTER, &file) == SQLITE_OK) {
+			sqlite3_file *original_file = ORIGFILE(file);
+			uint8_t header_bytes[32];
+			int file_rc = original_file->pMethods->xRead(original_file, header_bytes, sizeof(header_bytes), 0);
+			switch (file_rc) {
+				case SQLITE_OK: {
+					file->reserved_bytes = LOAD_8(header_bytes + SQLITE_FORMAT_RESERVED_BYTES_OFFSET);
+					file->page_size = LOAD_16_BE(header_bytes + SQLITE_FORMAT_PAGE_SIZE_OFFSET);
+					if (file->page_size == 1) {
+						file->page_size = 65536;
+					}
+					printf("RESERVED @ OPEN: %d\n", file->reserved_bytes);
+					printf("PAGE SIZE @ OPEN: %d\n", file->page_size);
+					break;
+				}
+
+				case SQLITE_IOERR_SHORT_READ: {
+					int reserve_bytes = CRYPTO_RESERVED_BYTES;
+					rc = sqlite3_file_control(db, NULL, SQLITE_FCNTL_RESERVE_BYTES, &reserve_bytes);
+					break;
+				}
+			}
+		}
+	}
+	return rc;
+}
+
 /* 
 ** This routine is called when the extension is loaded.
 ** Register the new VFS.
 */
 int sqlite3_cryptovfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
-	static sqlite3_vfs crypto_vfs = {
-		3,                            /* iVersion (set when registered) */
-		0,                            /* szOsFile (set when registered) */
-		1024,                         /* mxPathname */
-		0,                            /* pNext */
-		"cryptovfs",                  /* zName */
-		0,                            /* pAppData (set when registered) */ 
-		cryptoOpen,                   /* xOpen */
-		cryptoDelete,                 /* xDelete */
-		cryptoAccess,                 /* xAccess */
-		cryptoFullPathname,           /* xFullPathname */
-		cryptoDlOpen,                 /* xDlOpen */
-		cryptoDlError,                /* xDlError */
-		cryptoDlSym,                  /* xDlSym */
-		cryptoDlClose,                /* xDlClose */
-		cryptoRandomness,             /* xRandomness */
-		cryptoSleep,                  /* xSleep */
-		cryptoCurrentTime,            /* xCurrentTime */
-		cryptoGetLastError,           /* xGetLastError */
-		cryptoCurrentTimeInt64,       /* xCurrentTimeInt64 */
-		cryptoSetSystemCall,          /* xSetSystemCall */
-		cryptoGetSystemCall,          /* xGetSystemCall */
-		cryptoNextSystemCall,         /* xNextSystemCall */
-	};
-
 	SQLITE_EXTENSION_INIT2(pApi);
 	sqlite3_vfs *pOrig = sqlite3_vfs_find(NULL);
 	if (pOrig == NULL) {
@@ -201,6 +294,10 @@ int sqlite3_cryptovfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routi
 	crypto_vfs.pAppData = pOrig;
 	crypto_vfs.szOsFile = sizeof(encrypted_file) + pOrig->szOsFile;
 	int rc = sqlite3_vfs_register(&crypto_vfs, 1);
+	if (rc == SQLITE_OK) {
+		printf("CRYPTO %p, %p\n", sqlite3_vfs_find("cryptovfs"), &crypto_vfs);
+		rc = sqlite3_auto_extension((void(*)(void)) xEntryPoint);
+	}
 	if (rc == SQLITE_OK) {
 		rc = SQLITE_OK_LOAD_PERMANENTLY;
 	}

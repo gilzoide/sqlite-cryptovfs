@@ -1,0 +1,6 @@
+[submodule "libs/sqlite-vfs-cpp"]
+	path = libs/sqlite-vfs-cpp
+	url = https://github.com/gilzoide/sqlite-vfs-cpp.git
+[submodule "libs/libsodium"]
+	path = libs/libsodium
+	url = https://github.com/jedisct1/libsodium.git
