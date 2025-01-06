@@ -1,11 +1,20 @@
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cassert>
+#include <cstring>
+#include <cstdint>
+
 #include <sodium.h>
+#include <sqlite3.h>
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT1
+#include <SQLiteVfs.hpp>
+
+#include "cryptovfs.h"
+#include "sodium_memory.hpp"
+#include "sqlite_memory.hpp"
+#include "utils.hpp"
 
 // SQLite file format offsets
+#define SQLITE_FORMAT_HEADER_STRING "SQLite format 3"
 #define SQLITE_FORMAT_PAGE_SIZE_OFFSET 16
 #define SQLITE_FORMAT_RESERVED_BYTES_OFFSET 20
 #define SQLITE_FORMAT_HEADER_SIZE 100
@@ -20,286 +29,366 @@ SQLITE_EXTENSION_INIT1
 #define MAX(a, b) \
 	((a) > (b) ? (a) : (b))
 
-#define CRYPTO_RESERVED_BYTES \
-	MAX(crypto_secretstream_xchacha20poly1305_HEADERBYTES, crypto_secretstream_xchacha20poly1305_ABYTES)
+#define STARTS_WITH(buffer, literal_string) \
+	(memcmp((buffer), (literal_string), sizeof(literal_string) - 1) == 0)
 
+#define CRYPTOVFS_KEY_BYTES \
+	crypto_aead_xchacha20poly1305_ietf_KEYBYTES
+#define CRYPTOVFS_RESERVED_BYTES \
+	crypto_aead_xchacha20poly1305_ietf_ABYTES + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
+#define CRYPTOVFS_SALT_BYTES \
+	crypto_pwhash_SALTBYTES
+#define CRYPTOVFS_HEADER_UNENCRYPTED_BYTES 24
 
+static_assert(CRYPTOVFS_SALT_BYTES == sizeof(SQLITE_FORMAT_HEADER_STRING), "Salt has different byte size than SQLite format header string");
 
+using namespace sqlitevfs;
 
-typedef struct encrypted_file {
-	sqlite3_file base;
-	int page_size;
-	int reserved_bytes;
-	sqlite3_file original_file[0];
-} encrypted_file;
+namespace cryptovfs {
 
-#define ORIGVFS(p)  ((sqlite3_vfs *) (p)->pAppData)
-#define ORIGFILE(p)  (((encrypted_file *) (p))->original_file)
-
-typedef struct file_control_pragma {
-	char *result;
-	const char *name;
-	const char *argument;
-} file_control_pragma;
-
-///////////////////////////////////////////////////////////
-// File implementation
-///////////////////////////////////////////////////////////
-static int cryptoFileControl(sqlite3_file *pFile, int op, void *pArg) {
-	switch (op) {
-		case SQLITE_FCNTL_VFSNAME:
-			*(char **) pArg = sqlite3_mprintf("%z", "cryptovfs");
-			return SQLITE_OK;
-
-		case SQLITE_FCNTL_OVERWRITE:
-			printf("Overwriting!\n");
-			break;
-		
-		case SQLITE_FCNTL_PRAGMA: {
-			file_control_pragma *pragma_args = (file_control_pragma *) pArg;
-			if (sqlite3_stricmp(pragma_args->name, "key") == 0 || sqlite3_stricmp(pragma_args->name, "textkey") == 0) {
-				printf("GOT PRAGMA KEY\n");
-			}
-			break;
-		}
-		
-		default:
-			break;
-	}
-	return ORIGFILE(pFile)->pMethods->xFileControl(ORIGFILE(pFile), op, pArg);
-}
-
-static int cryptoRead(sqlite3_file *pFile, void *zBuf, int iAmt, sqlite_int64 iOfst) {
-	printf("READ %d from %lli\n", iAmt, iOfst);
-	return ORIGFILE(pFile)->pMethods->xRead(ORIGFILE(pFile), zBuf, iAmt, iOfst);
-}
-static int cryptoWrite(sqlite3_file *pFile, const void *zBuf, int iAmt, sqlite_int64 iOfst) {
-	printf("WRITE %d from %lli\n", iAmt, iOfst);
-	if (iOfst == 0 && iAmt >= SQLITE_FORMAT_HEADER_SIZE) {
-		encrypted_file *file = (encrypted_file *) pFile;
-		file->reserved_bytes = LOAD_8(zBuf + SQLITE_FORMAT_RESERVED_BYTES_OFFSET);
-		file->page_size = LOAD_16_BE(zBuf + SQLITE_FORMAT_PAGE_SIZE_OFFSET);
-		if (file->page_size == 1) {
-			file->page_size = 65536;
-		}
-		printf("RESERVED @ WRITE: %d\n", file->reserved_bytes);
-		printf("PAGE SIZE @ WRITE: %d\n", file->page_size);
-	}
-	return ORIGFILE(pFile)->pMethods->xWrite(ORIGFILE(pFile), zBuf, iAmt, iOfst);
-}
-// All other file methods are pass-thrus
-static int cryptoClose(sqlite3_file *pFile) {
-	return ORIGFILE(pFile)->pMethods->xClose(ORIGFILE(pFile));
-}
-static int cryptoTruncate(sqlite3_file *pFile, sqlite_int64 size) {
-	return ORIGFILE(pFile)->pMethods->xTruncate(ORIGFILE(pFile), size);
-}
-static int cryptoSync(sqlite3_file *pFile, int flags) {
-	return ORIGFILE(pFile)->pMethods->xSync(ORIGFILE(pFile), flags);
-}
-static int cryptoFileSize(sqlite3_file *pFile, sqlite_int64 *pSize) {
-	return ORIGFILE(pFile)->pMethods->xFileSize(ORIGFILE(pFile), pSize);
-}
-static int cryptoLock(sqlite3_file *pFile, int eLock) {
-	return ORIGFILE(pFile)->pMethods->xLock(ORIGFILE(pFile), eLock);
-}
-static int cryptoUnlock(sqlite3_file *pFile, int eLock) {
-	return ORIGFILE(pFile)->pMethods->xUnlock(ORIGFILE(pFile), eLock);
-}
-static int cryptoCheckReservedLock(sqlite3_file *pFile, int *pResOut) {
-	return ORIGFILE(pFile)->pMethods->xCheckReservedLock(ORIGFILE(pFile), pResOut);
-}
-static int cryptoSectorSize(sqlite3_file *pFile) {
-	return ORIGFILE(pFile)->pMethods->xSectorSize(ORIGFILE(pFile));
-}
-static int cryptoDeviceCharacteristics(sqlite3_file *pFile) {
-	return ORIGFILE(pFile)->pMethods->xDeviceCharacteristics(ORIGFILE(pFile));
-}
-static int cryptoShmMap(sqlite3_file *pFile, int iPg, int pgsz, int bExtend, volatile void **pp) {
-	return ORIGFILE(pFile)->pMethods->xShmMap(ORIGFILE(pFile), iPg, pgsz, bExtend, pp);
-}
-static int cryptoShmLock(sqlite3_file *pFile, int offset, int n, int flags) {
-	return ORIGFILE(pFile)->pMethods->xShmLock(ORIGFILE(pFile), offset, n, flags);
-}
-static void cryptoShmBarrier(sqlite3_file *pFile) {
-	ORIGFILE(pFile)->pMethods->xShmBarrier(ORIGFILE(pFile));
-}
-static int cryptoShmUnmap(sqlite3_file *pFile, int deleteFlag) {
-	return ORIGFILE(pFile)->pMethods->xShmUnmap(ORIGFILE(pFile), deleteFlag);
-}
-static int cryptoFetch(sqlite3_file *pFile, sqlite3_int64 iOfst, int iAmt, void **pp) {
-	return ORIGFILE(pFile)->pMethods->xFetch(ORIGFILE(pFile), iOfst, iAmt, pp);
-}
-static int cryptoUnfetch(sqlite3_file *pFile, sqlite3_int64 iOfst, void *pPage) {
-	return ORIGFILE(pFile)->pMethods->xUnfetch(ORIGFILE(pFile), iOfst, pPage);
-}
-
-
-///////////////////////////////////////////////////////////
-// VFS implementation
-///////////////////////////////////////////////////////////
-static int cryptoOpen(sqlite3_vfs *vfs, const char *zName, sqlite3_file *pFile, int flags, int *pOutFlags) {
-	sqlite3_vfs *original_vfs = ORIGVFS(vfs);
-	sqlite3_file *original_file = ORIGFILE(pFile);
-
-	int rc = original_vfs->xOpen(original_vfs, zName, original_file, flags, pOutFlags);
-	if (rc != SQLITE_OK) {
-		return rc;
-	}
-	
-	static sqlite3_io_methods io_methods = {
-		3,                              /* iVersion */
-		cryptoClose,                    /* xClose */
-		cryptoRead,                     /* xRead */
-		cryptoWrite,                    /* xWrite */
-		cryptoTruncate,                 /* xTruncate */
-		cryptoSync,                     /* xSync */
-		cryptoFileSize,                 /* xFileSize */
-		cryptoLock,                     /* xLock */
-		cryptoUnlock,                   /* xUnlock */
-		cryptoCheckReservedLock,        /* xCheckReservedLock */
-		cryptoFileControl,              /* xFileControl */
-		cryptoSectorSize,               /* xSectorSize */
-		cryptoDeviceCharacteristics,    /* xDeviceCharacteristics */
-		cryptoShmMap,                   /* xShmMap */
-		cryptoShmLock,                  /* xShmLock */
-		cryptoShmBarrier,               /* xShmBarrier */
-		cryptoShmUnmap,                 /* xShmUnmap */
-		cryptoFetch,                    /* xFetch */
-		cryptoUnfetch,                  /* xUnfetch */
-	};
-	encrypted_file *file = (encrypted_file *) pFile;
-	io_methods.iVersion = original_file->pMethods->iVersion;
-	file->base.pMethods = &io_methods;
-	return rc;
-}
-
-// All other file methods are pass-thrus
-static int cryptoDelete(sqlite3_vfs *vfs, const char *zPath, int dirSync){
-  return ORIGVFS(vfs)->xDelete(ORIGVFS(vfs), zPath, dirSync);
-}
-static int cryptoAccess(sqlite3_vfs *vfs, const char *zPath, int flags, int *pResOut) {
-	return ORIGVFS(vfs)->xAccess(ORIGVFS(vfs), zPath, flags, pResOut);
-}
-static int cryptoFullPathname(sqlite3_vfs *vfs, const char *zPath, int nOut, char *zOut) {
-	return ORIGVFS(vfs)->xFullPathname(ORIGVFS(vfs),zPath,nOut,zOut);
-}
-static void *cryptoDlOpen(sqlite3_vfs *vfs, const char *zPath) {
-	return ORIGVFS(vfs)->xDlOpen(ORIGVFS(vfs), zPath);
-}
-static void cryptoDlError(sqlite3_vfs *vfs, int nByte, char *zErrMsg){
-	ORIGVFS(vfs)->xDlError(ORIGVFS(vfs), nByte, zErrMsg);
-}
-static void (*cryptoDlSym(sqlite3_vfs *vfs, void *p, const char *zSym))(void) {
-	return ORIGVFS(vfs)->xDlSym(ORIGVFS(vfs), p, zSym);
-}
-static void cryptoDlClose(sqlite3_vfs *vfs, void *pHandle){
-	ORIGVFS(vfs)->xDlClose(ORIGVFS(vfs), pHandle);
-}
-static int cryptoRandomness(sqlite3_vfs *vfs, int nByte, char *zBufOut) {
-	return ORIGVFS(vfs)->xRandomness(ORIGVFS(vfs), nByte, zBufOut);
-}
-static int cryptoSleep(sqlite3_vfs *vfs, int nMicro) {
-	return ORIGVFS(vfs)->xSleep(ORIGVFS(vfs), nMicro);
-}
-static int cryptoCurrentTime(sqlite3_vfs *vfs, double *pTimeOut) {
-	return ORIGVFS(vfs)->xCurrentTime(ORIGVFS(vfs), pTimeOut);
-}
-static int cryptoGetLastError(sqlite3_vfs *vfs, int a, char *b) {
-	return ORIGVFS(vfs)->xGetLastError(ORIGVFS(vfs), a, b);
-}
-static int cryptoCurrentTimeInt64(sqlite3_vfs *vfs, sqlite3_int64 *p) {
-	return ORIGVFS(vfs)->xCurrentTimeInt64(ORIGVFS(vfs), p);
-}
-static int cryptoSetSystemCall(sqlite3_vfs *vfs, const char *zName, sqlite3_syscall_ptr pCall) {
-	return ORIGVFS(vfs)->xSetSystemCall(ORIGVFS(vfs),zName,pCall);
-}
-static sqlite3_syscall_ptr cryptoGetSystemCall(sqlite3_vfs *vfs, const char *zName) {
-	return ORIGVFS(vfs)->xGetSystemCall(ORIGVFS(vfs),zName);
-}
-static const char *cryptoNextSystemCall(sqlite3_vfs *vfs, const char *zName) {
-	return ORIGVFS(vfs)->xNextSystemCall(ORIGVFS(vfs), zName);
-}
-
-static sqlite3_vfs crypto_vfs = {
-	3,                            /* iVersion (set when registered) */
-	0,                            /* szOsFile (set when registered) */
-	1024,                         /* mxPathname */
-	0,                            /* pNext */
-	"cryptovfs",                  /* zName */
-	0,                            /* pAppData (set when registered) */ 
-	cryptoOpen,                   /* xOpen */
-	cryptoDelete,                 /* xDelete */
-	cryptoAccess,                 /* xAccess */
-	cryptoFullPathname,           /* xFullPathname */
-	cryptoDlOpen,                 /* xDlOpen */
-	cryptoDlError,                /* xDlError */
-	cryptoDlSym,                  /* xDlSym */
-	cryptoDlClose,                /* xDlClose */
-	cryptoRandomness,             /* xRandomness */
-	cryptoSleep,                  /* xSleep */
-	cryptoCurrentTime,            /* xCurrentTime */
-	cryptoGetLastError,           /* xGetLastError */
-	cryptoCurrentTimeInt64,       /* xCurrentTimeInt64 */
-	cryptoSetSystemCall,          /* xSetSystemCall */
-	cryptoGetSystemCall,          /* xGetSystemCall */
-	cryptoNextSystemCall,         /* xNextSystemCall */
+enum class EncryptedFileType {
+	Db,
+	Journal,
+	Wal,
+	Temp,
 };
 
-static int xEntryPoint(sqlite3 *db, const char **pzErrMsg, const struct sqlite3_api_routines *pThunk) {
-	int rc = SQLITE_OK;
-	sqlite3_vfs *vfs;
-	if (sqlite3_file_control(db, NULL, SQLITE_FCNTL_VFS_POINTER, &vfs) == SQLITE_OK
-		&& vfs == &crypto_vfs)
-	{
-		encrypted_file *file;
-		if (sqlite3_file_control(db, NULL, SQLITE_FCNTL_FILE_POINTER, &file) == SQLITE_OK) {
-			sqlite3_file *original_file = ORIGFILE(file);
-			uint8_t header_bytes[32];
-			int file_rc = original_file->pMethods->xRead(original_file, header_bytes, sizeof(header_bytes), 0);
-			switch (file_rc) {
-				case SQLITE_OK: {
-					file->reserved_bytes = LOAD_8(header_bytes + SQLITE_FORMAT_RESERVED_BYTES_OFFSET);
-					file->page_size = LOAD_16_BE(header_bytes + SQLITE_FORMAT_PAGE_SIZE_OFFSET);
-					if (file->page_size == 1) {
-						file->page_size = 65536;
-					}
-					printf("RESERVED @ OPEN: %d\n", file->reserved_bytes);
-					printf("PAGE SIZE @ OPEN: %d\n", file->page_size);
-					break;
-				}
+struct EncryptedFile : public SQLiteFileImpl {
+	SodiumMemory<char> text_key = nullptr;
+	SodiumMemory<unsigned char> key = nullptr;
+	SQLiteMemory<unsigned char> salt = nullptr;
+	SQLiteMemory<unsigned char> encryption_buffer = nullptr;
+	SQLiteMemory<unsigned char> nonce_buffer = nullptr;
+	int page_size = 0;
+	int reserved_bytes = 0;
+	EncryptedFileType file_type;
+	EncryptedFile *main_db_file;
 
-				case SQLITE_IOERR_SHORT_READ: {
-					int reserve_bytes = CRYPTO_RESERVED_BYTES;
-					rc = sqlite3_file_control(db, NULL, SQLITE_FCNTL_RESERVE_BYTES, &reserve_bytes);
-					break;
+	void setup(sqlite3_filename zName, int flags) {
+		if (flags & SQLITE_OPEN_MAIN_DB) {
+			file_type = EncryptedFileType::Db;
+			main_db_file = this;
+		}
+		else if (flags & SQLITE_OPEN_MAIN_JOURNAL) {
+			file_type = EncryptedFileType::Journal;
+			main_db_file = &((SQLiteFile<EncryptedFile> *) sqlite3_database_file_object(zName))->implementation;
+		}
+		else if (flags & SQLITE_OPEN_WAL) {
+			file_type = EncryptedFileType::Wal;
+			main_db_file = &((SQLiteFile<EncryptedFile> *) sqlite3_database_file_object(zName))->implementation;
+		}
+		else {
+			file_type = EncryptedFileType::Temp;
+			main_db_file = nullptr;
+		}
+
+		if (const char *textkey_uri = sqlite3_uri_parameter(zName, "textkey")) {
+			set_text_key(textkey_uri);
+		}
+		if (const char *key_uri = sqlite3_uri_parameter(zName, "key")) {
+			set_key(key_uri);
+		}
+		if (const char *hexkey_uri = sqlite3_uri_parameter(zName, "hexkey")) {
+			set_hex_key(hexkey_uri);
+		}
+	}
+
+	int xRead(void *p, int iAmt, sqlite3_int64 iOfst) override {
+		int base_result = SQLiteFileImpl::xRead(p, iAmt, iOfst);
+		if (base_result != SQLITE_OK || !main_db_file->is_encrypted()) {
+			return base_result;
+		}
+
+		switch (file_type) {
+			case EncryptedFileType::Db: {
+				if (iOfst == 0) {
+					read_first_page(p, iAmt);
 				}
+				assert(page_size > 0 && "FIXME: page size was not read yet");
+				// make sure we read the whole page before decrypting
+				if (iAmt != page_size) {
+					assert(iOfst / page_size == 0 && "FIXME: SQLite is partially reading something that is not in the first page");
+					encryption_buffer.resize_at_least(page_size);
+					base_result = SQLiteFileImpl::xRead(encryption_buffer, page_size, 0);
+					if (base_result != SQLITE_OK) {
+						return base_result;
+					}
+
+					if (const void *data = decrypt_page(encryption_buffer, page_size, 0)) {
+						memcpy(p, encryption_buffer.ptr() + iOfst, iAmt);
+					}
+					else {
+						return SQLITE_IOERR_READ;
+					}
+				}
+				else {
+					if (const void *data = decrypt_page((const unsigned char *) p, iAmt, iOfst)) {
+						memcpy(p, encryption_buffer.ptr(), iAmt);
+					}
+					else {
+						return SQLITE_IOERR_READ;
+					}
+				}
+				break;
+			}
+
+			case EncryptedFileType::Journal:
+			case EncryptedFileType::Wal:
+				if (iAmt == main_db_file->page_size) {
+					if (const void *data = decrypt_page((const unsigned char *) p, iAmt, iOfst)) {
+						memcpy(p, data, iAmt);
+					}
+					else {
+						return SQLITE_IOERR_READ;
+					}
+				}
+				break;
+
+			default:
+				break;
+		}
+
+		// The first page is special, as it stores the SQLite header and salt
+
+		return SQLITE_OK;
+	}
+
+	int xWrite(const void *p, int iAmt, sqlite3_int64 iOfst) override {
+		switch (file_type) {
+			case EncryptedFileType::Db:
+                // The first page is special, as it stores the SQLite header
+				if (iOfst == 0) {
+					read_first_page(p, iAmt);
+				}
+				if (is_encrypted()) {
+					p = encrypt_page((unsigned char *) p, iAmt);
+				}
+				break;
+
+			case EncryptedFileType::Journal:
+			case EncryptedFileType::Wal:
+				if (main_db_file->is_encrypted() && iAmt == main_db_file->page_size) {
+					p = encrypt_page((unsigned char *) p, iAmt);
+				}
+				break;
+
+			default:
+				break;
+		}
+
+		if (p == nullptr) {
+			return SQLITE_IOERR_WRITE;
+		}
+
+		return SQLiteFileImpl::xWrite(p, iAmt, iOfst);
+	}
+
+	int xFileControl(int op, void *pArg) override {
+		switch (op) {
+			case SQLITE_FCNTL_PRAGMA: {
+				char **args = (char **) pArg;
+				if (args[2] && strcasecmp(args[1], "textkey") == 0) {
+					set_text_key(args[2]);
+					return SQLITE_OK;
+				}
+				else if (args[2] && strcasecmp(args[1], "hexkey") == 0) {
+					set_hex_key(args[2]);
+					return SQLITE_OK;
+				}
+				else if (args[2] && strcasecmp(args[1], "key") == 0) {
+					set_key(args[2]);
+					return SQLITE_OK;
+				}
+				break;
+			}
+		}
+		return SQLiteFileImpl::xFileControl(op, pArg);
+	}
+
+private:
+	bool is_encrypted() const {
+		return key || text_key;
+	}
+
+	void set_text_key(const char *textkey) {
+		text_key = SodiumMemory<char>(textkey, strlen(textkey) + 1);
+	}
+
+	void set_hex_key(const char *hexkey) {
+		if (!key) {
+			key = SodiumMemory<unsigned char>((size_t) CRYPTOVFS_KEY_BYTES);
+		}
+		size_t hexkey_length = strlen(hexkey);
+		size_t binlen = 1;
+		for (int i = 0; i < CRYPTOVFS_KEY_BYTES && binlen > 0; i += binlen) {
+			sodium_hex2bin(key.ptr() + i, CRYPTOVFS_KEY_BYTES - i, hexkey, hexkey_length, ":", &binlen, NULL);
+		}
+	}
+
+	void set_key(const char *newkey) {
+		if (!key) {
+			key = SodiumMemory<unsigned char>((size_t) CRYPTOVFS_KEY_BYTES);
+		}
+		size_t newkey_length = strlen(newkey);
+		size_t batch_size;
+		for (int i = 0; i < CRYPTOVFS_KEY_BYTES; i += batch_size) {
+			batch_size = MIN(CRYPTOVFS_KEY_BYTES - i, newkey_length);
+			memcpy(key.ptr() + i, newkey, batch_size);
+		}
+	}
+
+	void read_first_page(const void *p, int size) {
+		if (size >= SQLITE_FORMAT_HEADER_SIZE) {
+			page_size = LOAD_16_BE(p + SQLITE_FORMAT_PAGE_SIZE_OFFSET);
+			if (page_size == 1) {
+				page_size = 65536;
+			}
+			reserved_bytes = LOAD_8(p + SQLITE_FORMAT_RESERVED_BYTES_OFFSET);
+
+			if (!STARTS_WITH(p, SQLITE_FORMAT_HEADER_STRING)) {
+				salt = SQLiteMemory<unsigned char>((unsigned char *) p, CRYPTOVFS_SALT_BYTES);
 			}
 		}
 	}
-	return rc;
+
+	const void *encrypt_page(const unsigned char *p, int iAmt) {
+		encryption_buffer.resize_at_least(iAmt);
+		int written_bytes = 0;
+		// 1st page: store the salt in place of "SQLite format 3" and skip page size and reserved bytes
+		if (STARTS_WITH(p, SQLITE_FORMAT_HEADER_STRING)) {
+			memcpy(encryption_buffer.ptr(), get_or_generate_salt(), CRYPTOVFS_SALT_BYTES);
+			memcpy(encryption_buffer.ptr() + CRYPTOVFS_SALT_BYTES, p + CRYPTOVFS_SALT_BYTES, CRYPTOVFS_HEADER_UNENCRYPTED_BYTES - CRYPTOVFS_SALT_BYTES);
+			written_bytes = CRYPTOVFS_HEADER_UNENCRYPTED_BYTES;
+		}
+
+		int reserved_bytes = main_db_file->reserved_bytes;
+		if (reserved_bytes >= 40) {
+			unsigned char *nonce = fill_nonce(p + iAmt - crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, true);
+			int result = crypto_aead_xchacha20poly1305_ietf_encrypt_detached(
+				encryption_buffer.ptr() + written_bytes,
+				encryption_buffer.ptr() + iAmt - 40, nullptr,
+				p + written_bytes, iAmt - written_bytes - reserved_bytes,
+				nullptr, 0,
+				nullptr,
+				nonce,
+				main_db_file->get_or_derive_key()
+			);
+			if (result != 0) {
+				return nullptr;
+			}
+			// write nonce into buffer
+			memcpy(encryption_buffer.ptr() + iAmt - crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, nonce, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+		}
+		return encryption_buffer;
+	}
+
+	const void *decrypt_page(const unsigned char *encrypted_page, int iAmt, sqlite3_int64 iOfst) {
+		encryption_buffer.resize_at_least(iAmt);
+
+		int written_bytes = 0;
+		if (iOfst == 0) {
+			memcpy(encryption_buffer.ptr(), SQLITE_FORMAT_HEADER_STRING, sizeof(SQLITE_FORMAT_HEADER_STRING));
+			memcpy(encryption_buffer.ptr() + sizeof(SQLITE_FORMAT_HEADER_STRING), encrypted_page + sizeof(SQLITE_FORMAT_HEADER_STRING), CRYPTOVFS_HEADER_UNENCRYPTED_BYTES - sizeof(SQLITE_FORMAT_HEADER_STRING));
+			written_bytes = CRYPTOVFS_HEADER_UNENCRYPTED_BYTES;
+		}
+
+		int reserved_bytes = main_db_file->reserved_bytes;
+		if (reserved_bytes >= 40) {
+			unsigned char *nonce = fill_nonce(encrypted_page + iAmt - crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, false);
+			int result = crypto_aead_xchacha20poly1305_ietf_decrypt_detached(
+				encryption_buffer.ptr() + written_bytes,
+				nullptr,
+				encrypted_page + written_bytes, iAmt - written_bytes - reserved_bytes,
+				encrypted_page + iAmt - 40,
+				nullptr, 0,
+				nonce,
+				main_db_file->get_or_derive_key()
+			);
+			if (result != 0) {
+				return nullptr;
+			}
+		}
+		return encryption_buffer;
+	}
+
+	unsigned char *get_or_generate_salt() {
+		if (!salt) {
+			salt.resize(CRYPTOVFS_SALT_BYTES);
+			randombytes_buf(salt, CRYPTOVFS_SALT_BYTES);
+		}
+		return salt;
+	}
+
+	unsigned char *fill_nonce(const unsigned char *buffer, int nonce_size, bool is_write) {
+		nonce_buffer.resize_at_least(nonce_size);
+		if (is_all_zeros(buffer, nonce_size)) {
+			assert(is_write && "FIXME: Reading nonce should never have all zeros");
+			randombytes_buf(nonce_buffer, nonce_size);
+		}
+		else {
+			memcpy(nonce_buffer, buffer, nonce_size);
+			if (is_write) {
+				sodium_increment(nonce_buffer, nonce_size);
+			}
+		}
+		return nonce_buffer;
+	}
+
+	unsigned char *get_or_derive_key() {
+		if (!key && text_key) {
+			key = SodiumMemory<unsigned char>((size_t) CRYPTOVFS_KEY_BYTES);
+			int result = crypto_pwhash(
+				key, CRYPTOVFS_KEY_BYTES,
+				text_key, text_key.size(),
+				salt,
+				crypto_pwhash_OPSLIMIT_MODERATE,
+				crypto_pwhash_MEMLIMIT_MODERATE,
+				crypto_pwhash_ALG_DEFAULT
+			);
+			if (result != 0) {
+				return nullptr;
+			}
+			text_key.free();
+		}
+		return key;
+	}
+};
+
+struct CryptoVfs : public SQLiteVfsImpl<EncryptedFile> {
+	int xOpen(sqlite3_filename zName, SQLiteFile<EncryptedFile> *file, int flags, int *pOutFlags) override {
+		int result = SQLiteVfsImpl::xOpen(zName, file, flags, pOutFlags);
+		if (result == SQLITE_OK) {
+			file->implementation.setup(zName, flags);
+		}
+		return result;
+	}
+};
+
 }
 
-/* 
+/*
 ** This routine is called when the extension is loaded.
 ** Register the new VFS.
 */
+extern "C" {
+
+int cryptovfs_register(int makeDefault) {
+	if (sodium_init() < 0) {
+		return -1;
+	}
+
+	static SQLiteVfs<cryptovfs::CryptoVfs> cryptovfs(CRYPTOVFS_NAME);
+	return cryptovfs.register_vfs(makeDefault);
+}
+
 int sqlite3_cryptovfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
 	SQLITE_EXTENSION_INIT2(pApi);
-	sqlite3_vfs *pOrig = sqlite3_vfs_find(NULL);
-	if (pOrig == NULL) {
-		return SQLITE_ERROR;
-	}
-	crypto_vfs.iVersion = pOrig->iVersion;
-	crypto_vfs.pAppData = pOrig;
-	crypto_vfs.szOsFile = sizeof(encrypted_file) + pOrig->szOsFile;
-	int rc = sqlite3_vfs_register(&crypto_vfs, 1);
-	if (rc == SQLITE_OK) {
-		printf("CRYPTO %p, %p\n", sqlite3_vfs_find("cryptovfs"), &crypto_vfs);
-		rc = sqlite3_auto_extension((void(*)(void)) xEntryPoint);
-	}
+
+	int rc = cryptovfs_register(1);
 	if (rc == SQLITE_OK) {
 		rc = SQLITE_OK_LOAD_PERMANENTLY;
 	}
 	return rc;
+}
+
 }
