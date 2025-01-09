@@ -5,9 +5,20 @@
 
 #include "sqlite3.h"
 
+int sql_callback(void *userdata, int column_count, char **column_values, char **column_names) {
+	printf("|");
+	for (int i = 0; i < column_count; i++) {
+		printf("%s", column_values[i]);
+		printf("|");
+	}
+	printf("\n");
+	return SQLITE_OK;
+}
+
 void run_sql(sqlite3 *db, const char *sql) {
 	char *errmsg;
-	sqlite3_exec(db, sql, NULL, NULL, &errmsg);
+	printf("> %s\n", sql);
+	sqlite3_exec(db, sql, sql_callback, NULL, &errmsg);
 	if (errmsg) {
 		printf("Error: %s\n  at %s\n", errmsg, sql);
 		sqlite3_free(errmsg);
@@ -26,10 +37,12 @@ int main(int argc, const char **argv) {
 		return 1;
 	}
 
-	int reserved_bytes = 40;
-	sqlite3_file_control(db, "main", SQLITE_FCNTL_RESERVE_BYTES, &reserved_bytes);
 	run_sql(db, "PRAGMA textkey = '012345'");
+	run_sql(db, "PRAGMA journal_mode = 'wal'");
+	run_sql(db, "BEGIN");
 	run_sql(db, "CREATE TABLE IF NOT EXISTS test(col1, col2)");
+	run_sql(db, "INSERT INTO test DEFAULT VALUES returning rowid");
+	run_sql(db, "COMMIT");
 
 	sqlite3_close(db);
 	return 0;

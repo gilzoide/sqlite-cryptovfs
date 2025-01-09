@@ -17,13 +17,15 @@ SQLITE_EXTENSION_INIT1
 #define SQLITE_FORMAT_HEADER_STRING "SQLite format 3"
 #define SQLITE_FORMAT_PAGE_SIZE_OFFSET 16
 #define SQLITE_FORMAT_RESERVED_BYTES_OFFSET 20
-#define SQLITE_FORMAT_HEADER_SIZE 100
+#define SQLITE_FORMAT_WAL_HEADER_SIZE 24
 
 // Helper macros for byte/math operations
 #define LOAD_8(p) \
 	(((uint8_t *) p)[0])
 #define LOAD_16_BE(p) \
-	(((uint8_t *) p)[0] << 8) + (((uint8_t *) p)[1])
+	((((uint8_t *) p)[0] << 8) + (((uint8_t *) p)[1]))
+#define LOAD_32_BE(p) \
+	((((uint8_t *) p)[0] << 24) + (((uint8_t *) p)[1] << 16) + (((uint8_t *) p)[2] << 8) + (((uint8_t *) p)[3]))
 #define MIN(a, b) \
 	((a) < (b) ? (a) : (b))
 #define MAX(a, b) \
@@ -32,12 +34,12 @@ SQLITE_EXTENSION_INIT1
 #define STARTS_WITH(buffer, literal_string) \
 	(memcmp((buffer), (literal_string), sizeof(literal_string) - 1) == 0)
 
-#define CRYPTOVFS_KEY_BYTES \
-	crypto_aead_xchacha20poly1305_ietf_KEYBYTES
-#define CRYPTOVFS_RESERVED_BYTES \
-	crypto_aead_xchacha20poly1305_ietf_ABYTES + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
-#define CRYPTOVFS_SALT_BYTES \
-	crypto_pwhash_SALTBYTES
+#define CRYPTOVFS_KEY_BYTES crypto_kdf_KEYBYTES
+#define CRYPTOVFS_SUBKEY_BYTES crypto_aead_chacha20poly1305_ietf_KEYBYTES
+#define CRYPTOVFS_NONCE_BYTES crypto_aead_chacha20poly1305_ietf_NPUBBYTES
+#define CRYPTOVFS_SALT_BYTES crypto_pwhash_SALTBYTES
+#define CRYPTOVFS_MAC_BYTES crypto_aead_chacha20poly1305_ietf_ABYTES
+#define CRYPTOVFS_DEFAULT_RESERVED_BYTES (CRYPTOVFS_MAC_BYTES + 8)
 #define CRYPTOVFS_HEADER_UNENCRYPTED_BYTES 24
 
 static_assert(CRYPTOVFS_SALT_BYTES == sizeof(SQLITE_FORMAT_HEADER_STRING), "Salt has different byte size than SQLite format header string");
@@ -54,13 +56,17 @@ enum class EncryptedFileType {
 };
 
 struct EncryptedFile : public SQLiteFileImpl {
+	// Keys are stored in secure memory (reference: https://doc.libsodium.org/memory_management)
 	SodiumMemory<char> text_key = nullptr;
 	SodiumMemory<unsigned char> key = nullptr;
+	SodiumMemory<unsigned char> subkey = nullptr;
+
 	SQLiteMemory<unsigned char> salt = nullptr;
 	SQLiteMemory<unsigned char> encryption_buffer = nullptr;
-	SQLiteMemory<unsigned char> nonce_buffer = nullptr;
+	unsigned char nonce_buffer[CRYPTOVFS_NONCE_BYTES];
 	int page_size = 0;
 	int reserved_bytes = 0;
+	uint32_t page_number;
 	EncryptedFileType file_type;
 	EncryptedFile *main_db_file;
 
@@ -83,13 +89,13 @@ struct EncryptedFile : public SQLiteFileImpl {
 		}
 
 		if (const char *textkey_uri = sqlite3_uri_parameter(zName, "textkey")) {
-			set_text_key(textkey_uri);
+			set_text_key(const_cast<char *>(textkey_uri));
 		}
 		if (const char *key_uri = sqlite3_uri_parameter(zName, "key")) {
-			set_key(key_uri);
+			set_key(const_cast<char *>(key_uri));
 		}
 		if (const char *hexkey_uri = sqlite3_uri_parameter(zName, "hexkey")) {
-			set_hex_key(hexkey_uri);
+			set_hex_key(const_cast<char *>(hexkey_uri));
 		}
 	}
 
@@ -101,9 +107,10 @@ struct EncryptedFile : public SQLiteFileImpl {
 
 		switch (file_type) {
 			case EncryptedFileType::Db: {
-				if (iOfst == 0) {
-					read_first_page(p, iAmt);
+				if (iOfst == 0 && iAmt >= CRYPTOVFS_HEADER_UNENCRYPTED_BYTES) {
+					process_db_header(p, iAmt);
 				}
+				fill_page_number(p, iAmt, iOfst, false);
 				assert(page_size > 0 && "FIXME: page size was not read yet");
 				// make sure we read the whole page before decrypting
 				if (iAmt != page_size) {
@@ -114,7 +121,7 @@ struct EncryptedFile : public SQLiteFileImpl {
 						return base_result;
 					}
 
-					if (const void *data = decrypt_page(encryption_buffer, page_size, 0)) {
+					if (const void *data = decrypt_page(encryption_buffer, page_size, page_number)) {
 						memcpy(p, encryption_buffer.ptr() + iOfst, iAmt);
 					}
 					else {
@@ -122,7 +129,7 @@ struct EncryptedFile : public SQLiteFileImpl {
 					}
 				}
 				else {
-					if (const void *data = decrypt_page((const unsigned char *) p, iAmt, iOfst)) {
+					if (const void *data = decrypt_page((const unsigned char *) p, iAmt, page_number)) {
 						memcpy(p, encryption_buffer.ptr(), iAmt);
 					}
 					else {
@@ -134,8 +141,11 @@ struct EncryptedFile : public SQLiteFileImpl {
 
 			case EncryptedFileType::Journal:
 			case EncryptedFileType::Wal:
+				if (!fill_page_number(p, iAmt, iOfst, false)) {
+					return SQLITE_IOERR_READ;
+				}
 				if (iAmt == main_db_file->page_size) {
-					if (const void *data = decrypt_page((const unsigned char *) p, iAmt, iOfst)) {
+					if (const void *data = decrypt_page((const unsigned char *) p, iAmt, page_number)) {
 						memcpy(p, data, iAmt);
 					}
 					else {
@@ -148,36 +158,36 @@ struct EncryptedFile : public SQLiteFileImpl {
 				break;
 		}
 
-		// The first page is special, as it stores the SQLite header and salt
-
 		return SQLITE_OK;
 	}
 
 	int xWrite(const void *p, int iAmt, sqlite3_int64 iOfst) override {
-		switch (file_type) {
-			case EncryptedFileType::Db:
-                // The first page is special, as it stores the SQLite header
-				if (iOfst == 0) {
-					read_first_page(p, iAmt);
-				}
-				if (is_encrypted()) {
-					p = encrypt_page((unsigned char *) p, iAmt);
-				}
-				break;
+		if (main_db_file->is_encrypted()) {
+			switch (file_type) {
+				case EncryptedFileType::Db:
+					if (iOfst == 0 && iAmt >= CRYPTOVFS_HEADER_UNENCRYPTED_BYTES) {
+						process_db_header(p, iAmt);
+					}
+					assert(iAmt == page_size && "Writing to database with a different page size");
+					fill_page_number(p, iAmt, iOfst, true);
+					p = encrypt_page((unsigned char *) p, iAmt, page_number);
+					break;
 
-			case EncryptedFileType::Journal:
-			case EncryptedFileType::Wal:
-				if (main_db_file->is_encrypted() && iAmt == main_db_file->page_size) {
-					p = encrypt_page((unsigned char *) p, iAmt);
-				}
-				break;
+				case EncryptedFileType::Journal:
+				case EncryptedFileType::Wal:
+					fill_page_number(p, iAmt, iOfst, true);
+					if (iOfst != 0 && iAmt == main_db_file->page_size) {
+						p = encrypt_page((unsigned char *) p, iAmt, page_number);
+					}
+					break;
 
-			default:
-				break;
-		}
+				default:
+					break;
+			}
 
-		if (p == nullptr) {
-			return SQLITE_IOERR_WRITE;
+			if (p == nullptr) {
+				return SQLITE_IOERR_WRITE;
+			}
 		}
 
 		return SQLiteFileImpl::xWrite(p, iAmt, iOfst);
@@ -210,11 +220,13 @@ private:
 		return key || text_key;
 	}
 
-	void set_text_key(const char *textkey) {
-		text_key = SodiumMemory<char>(textkey, strlen(textkey) + 1);
+	void set_text_key(char *textkey) {
+		size_t length = strlen(textkey);
+		text_key = SodiumMemory<char>(textkey, length + 1);
+		memset(textkey, '*', length);
 	}
 
-	void set_hex_key(const char *hexkey) {
+	void set_hex_key(char *hexkey) {
 		if (!key) {
 			key = SodiumMemory<unsigned char>((size_t) CRYPTOVFS_KEY_BYTES);
 		}
@@ -223,9 +235,10 @@ private:
 		for (int i = 0; i < CRYPTOVFS_KEY_BYTES && binlen > 0; i += binlen) {
 			sodium_hex2bin(key.ptr() + i, CRYPTOVFS_KEY_BYTES - i, hexkey, hexkey_length, ":", &binlen, NULL);
 		}
+		memset(hexkey, '*', hexkey_length);
 	}
 
-	void set_key(const char *newkey) {
+	void set_key(char *newkey) {
 		if (!key) {
 			key = SodiumMemory<unsigned char>((size_t) CRYPTOVFS_KEY_BYTES);
 		}
@@ -235,74 +248,111 @@ private:
 			batch_size = MIN(CRYPTOVFS_KEY_BYTES - i, newkey_length);
 			memcpy(key.ptr() + i, newkey, batch_size);
 		}
+		memset(newkey, '*', newkey_length);
 	}
 
-	void read_first_page(const void *p, int size) {
-		if (size >= SQLITE_FORMAT_HEADER_SIZE) {
-			page_size = LOAD_16_BE(p + SQLITE_FORMAT_PAGE_SIZE_OFFSET);
-			if (page_size == 1) {
-				page_size = 65536;
-			}
-			reserved_bytes = LOAD_8(p + SQLITE_FORMAT_RESERVED_BYTES_OFFSET);
+	void process_db_header(const void *p, int size) {
+		assert(size >= CRYPTOVFS_HEADER_UNENCRYPTED_BYTES);
+		page_size = LOAD_16_BE(p + SQLITE_FORMAT_PAGE_SIZE_OFFSET);
+		if (page_size == 1) {
+			page_size = 65536;
+		}
+		reserved_bytes = LOAD_8(p + SQLITE_FORMAT_RESERVED_BYTES_OFFSET);
 
-			if (!STARTS_WITH(p, SQLITE_FORMAT_HEADER_STRING)) {
-				salt = SQLiteMemory<unsigned char>((unsigned char *) p, CRYPTOVFS_SALT_BYTES);
-			}
+		if (!STARTS_WITH(p, SQLITE_FORMAT_HEADER_STRING)) {
+			salt = SQLiteMemory<unsigned char>((const unsigned char *) p, CRYPTOVFS_SALT_BYTES);
 		}
 	}
 
-	const void *encrypt_page(const unsigned char *p, int iAmt) {
+	const void *encrypt_page(const unsigned char *p, int iAmt, uint32_t page_number) {
 		encryption_buffer.resize_at_least(iAmt);
-		int written_bytes = 0;
-		// 1st page: store the salt in place of "SQLite format 3" and skip page size and reserved bytes
-		if (STARTS_WITH(p, SQLITE_FORMAT_HEADER_STRING)) {
-			memcpy(encryption_buffer.ptr(), get_or_generate_salt(), CRYPTOVFS_SALT_BYTES);
+
+		int written_bytes;
+		if (page_number == 1) {
+			// 1st page: store the salt in place of "SQLite format 3" and skip page size and reserved bytes
+			memcpy(encryption_buffer.ptr(), main_db_file->get_or_generate_salt(), CRYPTOVFS_SALT_BYTES);
 			memcpy(encryption_buffer.ptr() + CRYPTOVFS_SALT_BYTES, p + CRYPTOVFS_SALT_BYTES, CRYPTOVFS_HEADER_UNENCRYPTED_BYTES - CRYPTOVFS_SALT_BYTES);
 			written_bytes = CRYPTOVFS_HEADER_UNENCRYPTED_BYTES;
 		}
+		else {
+			written_bytes = 0;
+		}
 
 		int reserved_bytes = main_db_file->reserved_bytes;
-		if (reserved_bytes >= 40) {
-			unsigned char *nonce = fill_nonce(p + iAmt - crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, true);
-			int result = crypto_aead_xchacha20poly1305_ietf_encrypt_detached(
+		if (reserved_bytes > CRYPTOVFS_MAC_BYTES) {
+			int nonce_size = reserved_bytes - CRYPTOVFS_MAC_BYTES;
+			unsigned char *nonce = fill_nonce(p + iAmt - nonce_size, nonce_size, true);
+			int result = crypto_aead_chacha20poly1305_ietf_encrypt_detached(
 				encryption_buffer.ptr() + written_bytes,
-				encryption_buffer.ptr() + iAmt - 40, nullptr,
+				encryption_buffer.ptr() + iAmt - reserved_bytes, nullptr,
 				p + written_bytes, iAmt - written_bytes - reserved_bytes,
 				nullptr, 0,
 				nullptr,
 				nonce,
-				main_db_file->get_or_derive_key()
+				main_db_file->get_key(page_number)
 			);
 			if (result != 0) {
 				return nullptr;
 			}
 			// write nonce into buffer
-			memcpy(encryption_buffer.ptr() + iAmt - crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, nonce, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+			memcpy(encryption_buffer.ptr() + iAmt - nonce_size, nonce, MIN(nonce_size, CRYPTOVFS_NONCE_BYTES));
+		}
+		else {
+			int nonce_size = reserved_bytes;
+			unsigned char *nonce = fill_nonce(p + iAmt - nonce_size, nonce_size, true);
+			int result = crypto_stream_chacha20_ietf_xor(
+				encryption_buffer.ptr() + written_bytes,
+				p + written_bytes, iAmt - written_bytes - reserved_bytes,
+				nonce,
+				main_db_file->get_key(page_number)
+			);
+			if (result != 0) {
+				return nullptr;
+			}
+			// write nonce into buffer
+			memcpy(encryption_buffer.ptr() + iAmt - nonce_size, nonce, MIN(nonce_size, CRYPTOVFS_NONCE_BYTES));
 		}
 		return encryption_buffer;
 	}
 
-	const void *decrypt_page(const unsigned char *encrypted_page, int iAmt, sqlite3_int64 iOfst) {
+	const void *decrypt_page(const unsigned char *encrypted_page, int iAmt, uint32_t page_number) {
 		encryption_buffer.resize_at_least(iAmt);
 
-		int written_bytes = 0;
-		if (iOfst == 0) {
+		int written_bytes;
+		if (page_number == 1) {
 			memcpy(encryption_buffer.ptr(), SQLITE_FORMAT_HEADER_STRING, sizeof(SQLITE_FORMAT_HEADER_STRING));
 			memcpy(encryption_buffer.ptr() + sizeof(SQLITE_FORMAT_HEADER_STRING), encrypted_page + sizeof(SQLITE_FORMAT_HEADER_STRING), CRYPTOVFS_HEADER_UNENCRYPTED_BYTES - sizeof(SQLITE_FORMAT_HEADER_STRING));
 			written_bytes = CRYPTOVFS_HEADER_UNENCRYPTED_BYTES;
 		}
+		else {
+			written_bytes = 0;
+		}
 
 		int reserved_bytes = main_db_file->reserved_bytes;
-		if (reserved_bytes >= 40) {
-			unsigned char *nonce = fill_nonce(encrypted_page + iAmt - crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, false);
-			int result = crypto_aead_xchacha20poly1305_ietf_decrypt_detached(
+		if (reserved_bytes > CRYPTOVFS_MAC_BYTES) {
+			int nonce_size = reserved_bytes - CRYPTOVFS_MAC_BYTES;
+			unsigned char *nonce = fill_nonce(encrypted_page + iAmt - nonce_size, nonce_size, false);
+			int result = crypto_aead_chacha20poly1305_ietf_decrypt_detached(
 				encryption_buffer.ptr() + written_bytes,
 				nullptr,
 				encrypted_page + written_bytes, iAmt - written_bytes - reserved_bytes,
-				encrypted_page + iAmt - 40,
+				encrypted_page + iAmt - reserved_bytes,
 				nullptr, 0,
 				nonce,
-				main_db_file->get_or_derive_key()
+				main_db_file->get_key(page_number)
+			);
+			if (result != 0) {
+				return nullptr;
+			}
+		}
+		else {
+			int nonce_size = reserved_bytes;
+			unsigned char *nonce = fill_nonce(encrypted_page + iAmt - nonce_size, nonce_size, false);
+			int result = crypto_stream_chacha20_ietf_xor(
+				encryption_buffer.ptr() + written_bytes,
+				encrypted_page + written_bytes, iAmt - written_bytes - reserved_bytes,
+				nonce,
+				main_db_file->get_key(page_number)
 			);
 			if (result != 0) {
 				return nullptr;
@@ -320,7 +370,15 @@ private:
 	}
 
 	unsigned char *fill_nonce(const unsigned char *buffer, int nonce_size, bool is_write) {
-		nonce_buffer.resize_at_least(nonce_size);
+		int unset_bytes;
+		if (nonce_size > CRYPTOVFS_NONCE_BYTES) {
+			nonce_size = CRYPTOVFS_NONCE_BYTES;
+			unset_bytes = 0;
+		}
+		else {
+			unset_bytes = CRYPTOVFS_NONCE_BYTES - nonce_size;
+		}
+
 		if (is_all_zeros(buffer, nonce_size)) {
 			assert(is_write && "FIXME: Reading nonce should never have all zeros");
 			randombytes_buf(nonce_buffer, nonce_size);
@@ -331,26 +389,81 @@ private:
 				sodium_increment(nonce_buffer, nonce_size);
 			}
 		}
+		if (unset_bytes > 0) {
+			memset(nonce_buffer + nonce_size, 0, unset_bytes);
+		}
 		return nonce_buffer;
 	}
 
-	unsigned char *get_or_derive_key() {
-		if (!key && text_key) {
-			key = SodiumMemory<unsigned char>((size_t) CRYPTOVFS_KEY_BYTES);
-			int result = crypto_pwhash(
-				key, CRYPTOVFS_KEY_BYTES,
-				text_key, text_key.size(),
-				salt,
-				crypto_pwhash_OPSLIMIT_MODERATE,
-				crypto_pwhash_MEMLIMIT_MODERATE,
-				crypto_pwhash_ALG_DEFAULT
-			);
-			if (result != 0) {
+	unsigned char *get_key(uint64_t page_number) {
+		if (!key) {
+			if (text_key) {
+				key = SodiumMemory<unsigned char>((size_t) CRYPTOVFS_KEY_BYTES);
+				int result = crypto_pwhash(
+					key, CRYPTOVFS_KEY_BYTES,
+					text_key, text_key.size(),
+					salt,
+					crypto_pwhash_OPSLIMIT_MODERATE,
+					crypto_pwhash_MEMLIMIT_MODERATE,
+					crypto_pwhash_ALG_DEFAULT
+				);
+				if (result != 0) {
+					key.free();
+					return nullptr;
+				}
+				text_key.free();
+			}
+			else {
 				return nullptr;
 			}
-			text_key.free();
 		}
-		return key;
+		if (!subkey) {
+			subkey = SodiumMemory<unsigned char>((size_t) CRYPTOVFS_SUBKEY_BYTES);
+		}
+		int result = crypto_kdf_derive_from_key(subkey, CRYPTOVFS_SUBKEY_BYTES, page_number, (const char *) salt.ptr(), key);
+		if (result == 0) {
+			return subkey;
+		}
+		else {
+			return nullptr;
+		}
+	}
+
+	bool fill_page_number(const void *p, int iAmt, sqlite3_int64 iOfst, bool is_write) {
+		switch (file_type) {
+			case EncryptedFileType::Db:
+				assert(page_size > 0 && "FIXME: trying to find page number before reading page size");
+				page_number = (iOfst / page_size) + 1;
+				break;
+
+			case EncryptedFileType::Journal:
+				// SQLite always reads/writes the page number right before page data
+				if (iAmt == 4) {
+					page_number = LOAD_32_BE(p);
+				}
+				break;
+
+			case EncryptedFileType::Wal:
+				// SQLite writes the page number in the WAL frame header right before writing page data
+				if (is_write) {
+					if (iAmt == SQLITE_FORMAT_WAL_HEADER_SIZE) {
+						page_number = LOAD_32_BE(p);
+					}
+				}
+				// SQLite reads page data without necessarily reading the WAL frame header, so we must manually read it at all times
+				else if (SQLiteFileImpl::xRead(&page_number, 4, iOfst - SQLITE_FORMAT_WAL_HEADER_SIZE) == SQLITE_OK) {
+					page_number = LOAD_32_BE(&page_number);
+				}
+				else {
+					// report read error for WAL reads
+					return false;
+				}
+				break;
+
+			default:
+				break;
+        }
+		return true;
 	}
 };
 
@@ -364,12 +477,31 @@ struct CryptoVfs : public SQLiteVfsImpl<EncryptedFile> {
 	}
 };
 
+
+/**
+ * Auto extension to run on new databases: if creating the database (its size is 0),
+ * reserve a default amount of bytes for storing the encryption nonce and authentication tag.
+ */
+int auto_extension(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
+	SQLITE_EXTENSION_INIT2(pApi);
+
+	sqlite3_vfs *vfs = nullptr;
+	sqlite3_file_control(db, nullptr, SQLITE_FCNTL_VFS_POINTER, &vfs);
+	if (vfs && strcmp(vfs->zName, CRYPTOVFS_NAME) == 0) {
+		sqlite3_file *file = nullptr;
+		sqlite3_int64 file_size;
+		sqlite3_file_control(db, nullptr, SQLITE_FCNTL_FILE_POINTER, &file);
+		if (file && file->pMethods->xFileSize(file, &file_size) == SQLITE_OK && file_size == 0) {
+			int reserved_bytes = CRYPTOVFS_DEFAULT_RESERVED_BYTES;
+			sqlite3_file_control(db, nullptr, SQLITE_FCNTL_RESERVE_BYTES, &reserved_bytes);
+		}
+	}
+
+	return SQLITE_OK;
 }
 
-/*
-** This routine is called when the extension is loaded.
-** Register the new VFS.
-*/
+}
+
 extern "C" {
 
 int cryptovfs_register(int makeDefault) {
@@ -377,10 +509,16 @@ int cryptovfs_register(int makeDefault) {
 		return -1;
 	}
 
+	sqlite3_auto_extension((void (*)(void)) cryptovfs::auto_extension);
+
 	static SQLiteVfs<cryptovfs::CryptoVfs> cryptovfs(CRYPTOVFS_NAME);
 	return cryptovfs.register_vfs(makeDefault);
 }
 
+/*
+** This routine is called when the extension is loaded.
+** Register the new VFS.
+*/
 int sqlite3_cryptovfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
 	SQLITE_EXTENSION_INIT2(pApi);
 
