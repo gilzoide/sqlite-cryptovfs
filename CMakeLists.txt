@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.0)
 project(sqlite3-cryptovfs C CXX)
 
 option(CRYPTOVFS_BUILD_TEST "Whether test executable should be built" OFF)
+option(CRYPTOVFS_ENABLE_ASAN "Whether to enable address sanitizer" OFF)
 option(BUILD_SHARED_LIBS "Whether to build shared library" OFF)
 
 include(ExternalProject)
@@ -35,6 +36,11 @@ if (BUILD_SHARED_LIBS)
     target_link_libraries(cryptovfs sqlite3)
 endif ()
 add_dependencies(cryptovfs libsodium)
+
+if (CRYPTOVFS_ENABLE_ASAN)
+    target_compile_options(cryptovfs PRIVATE "-fno-omit-frame-pointer" "-fsanitize=address")
+    target_link_options(cryptovfs PRIVATE "-fno-omit-frame-pointer" "-fsanitize=address")
+endif ()
 
 if (CRYPTOVFS_BUILD_TEST)
     add_subdirectory(test)

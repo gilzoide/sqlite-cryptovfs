@@ -16,4 +16,8 @@ set_source_files_properties("sqlite3.c"
         -DHAVE_ISNAN \
     "
 )
+if (CRYPTOVFS_ENABLE_ASAN)
+    target_compile_options(cryptovfs_test PRIVATE "-fno-omit-frame-pointer" "-fsanitize=address")
+    target_link_options(cryptovfs_test PRIVATE "-fno-omit-frame-pointer" "-fsanitize=address")
+endif ()
 target_link_libraries(cryptovfs_test cryptovfs)
