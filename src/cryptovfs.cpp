@@ -506,7 +506,7 @@ extern "C" {
 
 int cryptovfs_register(int makeDefault) {
 	if (sodium_init() < 0) {
-		return -1;
+		return CRYPTOVFS_LIBSODIUM_INIT_ERROR;
 	}
 
 	sqlite3_auto_extension((void (*)(void)) cryptovfs::auto_extension);
