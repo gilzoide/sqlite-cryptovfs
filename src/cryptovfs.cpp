@@ -522,7 +522,7 @@ int cryptovfs_register(int makeDefault) {
 int sqlite3_cryptovfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
 	SQLITE_EXTENSION_INIT2(pApi);
 
-	int rc = cryptovfs_register(1);
+	int rc = cryptovfs_register(0);
 	if (rc == SQLITE_OK) {
 		rc = SQLITE_OK_LOAD_PERMANENTLY;
 	}

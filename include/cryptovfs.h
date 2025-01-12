@@ -20,6 +20,11 @@ extern "C" {
  */
 int cryptovfs_register(int makeDefault);
 
+/**
+ * Extension entrypoint when loading cryptovfs dynamically.
+ * Registers cryptovfs, without making it the default VFS.
+ * @see https://sqlite.org/loadext.html
+ */
 int sqlite3_cryptovfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi);
 
 #ifdef __cplusplus
