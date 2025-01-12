@@ -109,7 +109,7 @@ struct EncryptedFile : public SQLiteFileImpl {
 
 	int xRead(void *p, int iAmt, sqlite3_int64 iOfst) override {
 		RETURN_IF_NOT_OK(SQLiteFileImpl::xRead(p, iAmt, iOfst));
-		if (!main_db_file->is_encrypted()) {
+		if (!is_encrypted()) {
 			return SQLITE_OK;
 		}
 
@@ -165,7 +165,7 @@ struct EncryptedFile : public SQLiteFileImpl {
 	}
 
 	int xWrite(const void *p, int iAmt, sqlite3_int64 iOfst) override {
-		if (main_db_file->is_encrypted()) {
+		if (is_encrypted()) {
 			switch (file_type) {
 				case EncryptedFileType::Db:
 					if (iOfst == 0 && iAmt >= CRYPTOVFS_HEADER_UNENCRYPTED_BYTES) {
@@ -220,13 +220,15 @@ struct EncryptedFile : public SQLiteFileImpl {
 
 private:
 	bool is_encrypted() const {
-		return key || text_key;
+		return main_db_file && (main_db_file->key || main_db_file->text_key);
 	}
 
 	void set_text_key(char *textkey) {
 		size_t length = strlen(textkey);
 		text_key = SodiumMemory<char>(textkey, length + 1);
 		memset(textkey, '*', length);
+		// free key to force reload it from textkey next time encryption is used
+		key.free();
 	}
 
 	void set_hex_key(char *hexkey) {
