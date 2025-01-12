@@ -19,6 +19,16 @@ SQLITE_EXTENSION_INIT1
 #define SQLITE_FORMAT_RESERVED_BYTES_OFFSET 20
 #define SQLITE_FORMAT_WAL_HEADER_SIZE 24
 
+// Constant byte sizes
+#define CRYPTOVFS_KEY_BYTES crypto_kdf_KEYBYTES
+#define CRYPTOVFS_SUBKEY_BYTES crypto_aead_chacha20poly1305_ietf_KEYBYTES
+#define CRYPTOVFS_NONCE_BYTES crypto_aead_chacha20poly1305_ietf_NPUBBYTES
+#define CRYPTOVFS_SALT_BYTES crypto_pwhash_SALTBYTES
+#define CRYPTOVFS_MAC_BYTES crypto_aead_chacha20poly1305_ietf_ABYTES
+#define CRYPTOVFS_DEFAULT_RESERVED_BYTES (CRYPTOVFS_MAC_BYTES + 8)
+#define CRYPTOVFS_HEADER_UNENCRYPTED_BYTES 24
+static_assert(CRYPTOVFS_SALT_BYTES == sizeof(SQLITE_FORMAT_HEADER_STRING), "Salt has different byte size than SQLite format header string");
+
 // Helper macros for byte/math operations
 #define LOAD_8(p) \
 	(((uint8_t *) p)[0])
@@ -31,18 +41,16 @@ SQLITE_EXTENSION_INIT1
 #define MAX(a, b) \
 	((a) > (b) ? (a) : (b))
 
+// Helper logic macros
 #define STARTS_WITH(buffer, literal_string) \
 	(memcmp((buffer), (literal_string), sizeof(literal_string) - 1) == 0)
-
-#define CRYPTOVFS_KEY_BYTES crypto_kdf_KEYBYTES
-#define CRYPTOVFS_SUBKEY_BYTES crypto_aead_chacha20poly1305_ietf_KEYBYTES
-#define CRYPTOVFS_NONCE_BYTES crypto_aead_chacha20poly1305_ietf_NPUBBYTES
-#define CRYPTOVFS_SALT_BYTES crypto_pwhash_SALTBYTES
-#define CRYPTOVFS_MAC_BYTES crypto_aead_chacha20poly1305_ietf_ABYTES
-#define CRYPTOVFS_DEFAULT_RESERVED_BYTES (CRYPTOVFS_MAC_BYTES + 8)
-#define CRYPTOVFS_HEADER_UNENCRYPTED_BYTES 24
-
-static_assert(CRYPTOVFS_SALT_BYTES == sizeof(SQLITE_FORMAT_HEADER_STRING), "Salt has different byte size than SQLite format header string");
+#define RETURN_IF_NOT_OK(statement) \
+	{ \
+		int result = statement; \
+		if (result != SQLITE_OK) { \
+			return result; \
+		} \
+	}
 
 using namespace sqlitevfs;
 
@@ -100,9 +108,9 @@ struct EncryptedFile : public SQLiteFileImpl {
 	}
 
 	int xRead(void *p, int iAmt, sqlite3_int64 iOfst) override {
-		int base_result = SQLiteFileImpl::xRead(p, iAmt, iOfst);
-		if (base_result != SQLITE_OK || !main_db_file->is_encrypted()) {
-			return base_result;
+		RETURN_IF_NOT_OK(SQLiteFileImpl::xRead(p, iAmt, iOfst));
+		if (!main_db_file->is_encrypted()) {
+			return SQLITE_OK;
 		}
 
 		switch (file_type) {
@@ -110,16 +118,13 @@ struct EncryptedFile : public SQLiteFileImpl {
 				if (iOfst == 0 && iAmt >= CRYPTOVFS_HEADER_UNENCRYPTED_BYTES) {
 					process_db_header(p, iAmt);
 				}
-				fill_page_number(p, iAmt, iOfst, false);
+				RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, false));
 				assert(page_size > 0 && "FIXME: page size was not read yet");
 				// make sure we read the whole page before decrypting
 				if (iAmt != page_size) {
 					assert(iOfst / page_size == 0 && "FIXME: SQLite is partially reading something that is not in the first page");
 					encryption_buffer.resize_at_least(page_size);
-					base_result = SQLiteFileImpl::xRead(encryption_buffer, page_size, 0);
-					if (base_result != SQLITE_OK) {
-						return base_result;
-					}
+					RETURN_IF_NOT_OK(SQLiteFileImpl::xRead(encryption_buffer, page_size, 0));
 
 					if (const void *data = decrypt_page(encryption_buffer, page_size, page_number)) {
 						memcpy(p, encryption_buffer.ptr() + iOfst, iAmt);
@@ -141,9 +146,7 @@ struct EncryptedFile : public SQLiteFileImpl {
 
 			case EncryptedFileType::Journal:
 			case EncryptedFileType::Wal:
-				if (!fill_page_number(p, iAmt, iOfst, false)) {
-					return SQLITE_IOERR_READ;
-				}
+				RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, false));
 				if (iAmt == main_db_file->page_size) {
 					if (const void *data = decrypt_page((const unsigned char *) p, iAmt, page_number)) {
 						memcpy(p, data, iAmt);
@@ -169,13 +172,13 @@ struct EncryptedFile : public SQLiteFileImpl {
 						process_db_header(p, iAmt);
 					}
 					assert(iAmt == page_size && "Writing to database with a different page size");
-					fill_page_number(p, iAmt, iOfst, true);
+					RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, true));
 					p = encrypt_page((unsigned char *) p, iAmt, page_number);
 					break;
 
 				case EncryptedFileType::Journal:
 				case EncryptedFileType::Wal:
-					fill_page_number(p, iAmt, iOfst, true);
+					RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, true));
 					if (iOfst != 0 && iAmt == main_db_file->page_size) {
 						p = encrypt_page((unsigned char *) p, iAmt, page_number);
 					}
@@ -429,7 +432,7 @@ private:
 		}
 	}
 
-	bool fill_page_number(const void *p, int iAmt, sqlite3_int64 iOfst, bool is_write) {
+	int fill_page_number(const void *p, int iAmt, sqlite3_int64 iOfst, bool is_write) {
 		switch (file_type) {
 			case EncryptedFileType::Db:
 				assert(page_size > 0 && "FIXME: trying to find page number before reading page size");
@@ -451,19 +454,16 @@ private:
 					}
 				}
 				// SQLite reads page data without necessarily reading the WAL frame header, so we must manually read it at all times
-				else if (SQLiteFileImpl::xRead(&page_number, 4, iOfst - SQLITE_FORMAT_WAL_HEADER_SIZE) == SQLITE_OK) {
-					page_number = LOAD_32_BE(&page_number);
-				}
 				else {
-					// report read error for WAL reads
-					return false;
+					RETURN_IF_NOT_OK(SQLiteFileImpl::xRead(&page_number, 4, iOfst - SQLITE_FORMAT_WAL_HEADER_SIZE));
+					page_number = LOAD_32_BE(&page_number);
 				}
 				break;
 
 			default:
 				break;
         }
-		return true;
+		return SQLITE_OK;
 	}
 };
 
