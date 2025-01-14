@@ -114,7 +114,7 @@ struct EncryptedFile : public SQLiteFileImpl {
 		}
 
 		switch (file_type) {
-			case EncryptedFileType::Db: {
+			case EncryptedFileType::Db:
 				if (iOfst == 0 && iAmt >= CRYPTOVFS_HEADER_UNENCRYPTED_BYTES) {
 					process_db_header(p, iAmt);
 				}
@@ -142,7 +142,6 @@ struct EncryptedFile : public SQLiteFileImpl {
 					}
 				}
 				break;
-			}
 
 			case EncryptedFileType::Journal:
 			case EncryptedFileType::Wal:
@@ -407,7 +406,7 @@ private:
 				int result = crypto_pwhash(
 					key, CRYPTOVFS_KEY_BYTES,
 					text_key, text_key.size(),
-					salt,
+					get_or_generate_salt(),
 					crypto_pwhash_OPSLIMIT_MODERATE,
 					crypto_pwhash_MEMLIMIT_MODERATE,
 					crypto_pwhash_ALG_DEFAULT
