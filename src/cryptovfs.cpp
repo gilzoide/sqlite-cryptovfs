@@ -471,7 +471,7 @@ private:
 					}
 				}
 				// SQLite reads page data without necessarily reading the WAL frame header, so we must manually read it at all times
-				else {
+				else if (iAmt == main_db_file->page_size) {
 					RETURN_IF_NOT_OK(SQLiteFileImpl::xRead(&page_number, 4, iOfst - SQLITE_FORMAT_WAL_HEADER_SIZE));
 					page_number = LOAD_32_BE(&page_number);
 				}
