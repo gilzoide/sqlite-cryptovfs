@@ -4,22 +4,18 @@ project(sqlite3-cryptovfs C CXX)
 
 option(CRYPTOVFS_BUILD_TEST "Whether test executable should be built" OFF)
 option(CRYPTOVFS_ENABLE_ASAN "Whether to enable address sanitizer" OFF)
-option(BUILD_SHARED_LIBS "Whether to build shared library" OFF)
+option(CRYPTOVFS_BUILD_SHARED_LIBS "Whether to build cryptovfs as a shared library" ${BUILD_SHARED_LIBS})
 
-include(ExternalProject)
-execute_process(
-    COMMAND sh autogen.sh -s
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/libs/libsodium"
-)
-ExternalProject_Add(
-    libsodium
-    SOURCE_DIR "${CMAKE_SOURCE_DIR}/libs/libsodium"
-    CONFIGURE_COMMAND "${CMAKE_SOURCE_DIR}/libs/libsodium/configure" "--prefix=${CMAKE_CURRENT_BINARY_DIR}"
-    BUILD_COMMAND make
-    COMMAND make install
-)
+add_subdirectory(libs)
+
+if (CRYPTOVFS_BUILD_SHARED_LIBS)
+    set(CRYPTOVFS_LIBRARY_TYPE SHARED)
+else ()
+    set(CRYPTOVFS_LIBRARY_TYPE STATIC)
+endif ()
 
 add_library(cryptovfs
+    ${CRYPTOVFS_LIBRARY_TYPE}
     "include/cryptovfs.h"
     "src/cryptovfs.cpp"
     "src/sqlite_memory.hpp"
@@ -27,15 +23,11 @@ add_library(cryptovfs
     "src/utils.hpp"
 )
 target_compile_features(cryptovfs PRIVATE cxx_std_11)
-target_include_directories(cryptovfs
-    PUBLIC "include"
-    PRIVATE "libs/sqlite-vfs-cpp" "${CMAKE_CURRENT_BINARY_DIR}/include"
-)
-target_link_libraries(cryptovfs "${CMAKE_CURRENT_BINARY_DIR}/lib/libsodium.a")
-if (BUILD_SHARED_LIBS)
+target_include_directories(cryptovfs PUBLIC "include")
+if (CRYPTOVFS_BUILD_SHARED_LIBS)
     target_link_libraries(cryptovfs sqlite3)
 endif ()
-add_dependencies(cryptovfs libsodium)
+target_link_libraries(cryptovfs libs)
 
 if (CRYPTOVFS_ENABLE_ASAN)
     target_compile_options(cryptovfs PRIVATE "-fno-omit-frame-pointer" "-fsanitize=address")
