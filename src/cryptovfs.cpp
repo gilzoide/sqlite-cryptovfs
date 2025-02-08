@@ -63,6 +63,11 @@ enum class EncryptedFileType {
 	Temp,
 };
 
+enum class IoOp {
+	Read,
+	Write,
+};
+
 struct EncryptedFile : public SQLiteFileImpl {
 	// Keys are stored in secure memory (reference: https://doc.libsodium.org/memory_management)
 	SodiumMemory<char> text_key = nullptr;
@@ -77,6 +82,7 @@ struct EncryptedFile : public SQLiteFileImpl {
 	uint32_t page_number;
 	EncryptedFileType file_type;
 	EncryptedFile *main_db_file;
+	bool file_contains_sqlite_header = true;
 
 	void setup(sqlite3_filename zName, int flags) {
 		if (flags & SQLITE_OPEN_MAIN_DB) {
@@ -116,9 +122,9 @@ struct EncryptedFile : public SQLiteFileImpl {
 		switch (file_type) {
 			case EncryptedFileType::Db:
 				if (iOfst == 0 && iAmt >= CRYPTOVFS_HEADER_UNENCRYPTED_BYTES) {
-					process_db_header(p, iAmt);
+					process_db_header(p, iAmt, IoOp::Read);
 				}
-				RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, false));
+				RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, IoOp::Read));
 				assert(page_size > 0 && "FIXME: page size was not read yet");
 				// make sure we read the whole page before decrypting
 				if (iAmt != page_size) {
@@ -145,7 +151,7 @@ struct EncryptedFile : public SQLiteFileImpl {
 
 			case EncryptedFileType::Journal:
 			case EncryptedFileType::Wal:
-				RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, false));
+				RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, IoOp::Read));
 				if (iAmt == main_db_file->page_size) {
 					if (const void *data = decrypt_page((const unsigned char *) p, iAmt, page_number)) {
 						memcpy(p, data, iAmt);
@@ -168,16 +174,16 @@ struct EncryptedFile : public SQLiteFileImpl {
 			switch (file_type) {
 				case EncryptedFileType::Db:
 					if (iOfst == 0 && iAmt >= CRYPTOVFS_HEADER_UNENCRYPTED_BYTES) {
-						process_db_header(p, iAmt);
+						process_db_header(p, iAmt, IoOp::Write);
 					}
 					assert(iAmt == page_size && "Writing to database with a different page size");
-					RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, true));
+					RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, IoOp::Write));
 					p = encrypt_page((unsigned char *) p, iAmt, page_number);
 					break;
 
 				case EncryptedFileType::Journal:
 				case EncryptedFileType::Wal:
-					RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, true));
+					RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, IoOp::Write));
 					if (iOfst != 0 && iAmt == main_db_file->page_size) {
 						p = encrypt_page((unsigned char *) p, iAmt, page_number);
 					}
@@ -219,7 +225,9 @@ struct EncryptedFile : public SQLiteFileImpl {
 
 private:
 	bool is_encrypted() const {
-		return main_db_file && (main_db_file->key || main_db_file->text_key);
+		return main_db_file
+			&& !main_db_file->file_contains_sqlite_header
+			&& (main_db_file->key || main_db_file->text_key);
 	}
 
 	void set_text_key(char *textkey) {
@@ -255,7 +263,7 @@ private:
 		memset(newkey, '*', newkey_length);
 	}
 
-	void process_db_header(const void *p, int size) {
+	void process_db_header(const void *p, int size, IoOp ioop) {
 		assert(size >= CRYPTOVFS_HEADER_UNENCRYPTED_BYTES);
 		page_size = LOAD_16_BE(p + SQLITE_FORMAT_PAGE_SIZE_OFFSET);
 		if (page_size == 1) {
@@ -263,8 +271,11 @@ private:
 		}
 		reserved_bytes = LOAD_8(p + SQLITE_FORMAT_RESERVED_BYTES_OFFSET);
 
-		if (!STARTS_WITH(p, SQLITE_FORMAT_HEADER_STRING)) {
-			salt = SQLiteMemory<unsigned char>((const unsigned char *) p, CRYPTOVFS_SALT_BYTES);
+		if (ioop == IoOp::Read) {
+			file_contains_sqlite_header = STARTS_WITH(p, SQLITE_FORMAT_HEADER_STRING);
+			if (!file_contains_sqlite_header) {
+				salt = SQLiteMemory<unsigned char>((const unsigned char *) p, CRYPTOVFS_SALT_BYTES);
+			}
 		}
 	}
 
@@ -433,7 +444,7 @@ private:
 		}
 	}
 
-	int fill_page_number(const void *p, int iAmt, sqlite3_int64 iOfst, bool is_write) {
+	int fill_page_number(const void *p, int iAmt, sqlite3_int64 iOfst, IoOp ioop) {
 		switch (file_type) {
 			case EncryptedFileType::Db:
 				assert(page_size > 0 && "FIXME: trying to find page number before reading page size");
@@ -449,7 +460,7 @@ private:
 
 			case EncryptedFileType::Wal:
 				// SQLite writes the page number in the WAL frame header right before writing page data
-				if (is_write) {
+				if (ioop == IoOp::Write) {
 					if (iAmt == SQLITE_FORMAT_WAL_HEADER_SIZE) {
 						page_number = LOAD_32_BE(p);
 					}
