@@ -20,13 +20,14 @@ SQLITE_EXTENSION_INIT1
 #define SQLITE_FORMAT_WAL_HEADER_SIZE 24
 
 // Constant byte sizes
-#define CRYPTOVFS_KEY_BYTES crypto_kdf_KEYBYTES
-#define CRYPTOVFS_SUBKEY_BYTES crypto_aead_chacha20poly1305_ietf_KEYBYTES
-#define CRYPTOVFS_NONCE_BYTES crypto_aead_chacha20poly1305_ietf_NPUBBYTES
-#define CRYPTOVFS_SALT_BYTES crypto_pwhash_SALTBYTES
-#define CRYPTOVFS_MAC_BYTES crypto_aead_chacha20poly1305_ietf_ABYTES
-#define CRYPTOVFS_DEFAULT_RESERVED_BYTES (CRYPTOVFS_MAC_BYTES + 8)
-#define CRYPTOVFS_HEADER_UNENCRYPTED_BYTES 24
+static const int CRYPTOVFS_KEY_BYTES = crypto_kdf_KEYBYTES;
+static const int CRYPTOVFS_SUBKEY_BYTES = crypto_aead_chacha20poly1305_ietf_KEYBYTES;
+static const int CRYPTOVFS_NONCE_BYTES = crypto_aead_chacha20poly1305_ietf_NPUBBYTES;
+static const int CRYPTOVFS_SALT_BYTES = crypto_pwhash_SALTBYTES;
+static const int CRYPTOVFS_MAC_BYTES = crypto_aead_chacha20poly1305_ietf_ABYTES;
+// With 8 byte nonces, we can securely write 2^64 times into the same page.
+static const int CRYPTOVFS_DEFAULT_RESERVED_BYTES = CRYPTOVFS_MAC_BYTES + 8;
+static const int CRYPTOVFS_HEADER_UNENCRYPTED_BYTES = 24;
 static_assert(CRYPTOVFS_SALT_BYTES == sizeof(SQLITE_FORMAT_HEADER_STRING), "Salt has different byte size than SQLite format header string");
 
 // Helper macros for byte/math operations
@@ -82,7 +83,7 @@ struct EncryptedFile : public SQLiteFileImpl {
 	uint32_t page_number;
 	EncryptedFileType file_type;
 	EncryptedFile *main_db_file;
-	bool file_contains_sqlite_header = true;
+	bool file_contains_sqlite_header = false;
 
 	void setup(sqlite3_filename zName, int flags) {
 		if (flags & SQLITE_OPEN_MAIN_DB) {
@@ -123,6 +124,10 @@ struct EncryptedFile : public SQLiteFileImpl {
 			case EncryptedFileType::Db:
 				if (iOfst == 0 && iAmt >= CRYPTOVFS_HEADER_UNENCRYPTED_BYTES) {
 					process_db_header(p, iAmt, IoOp::Read);
+					// the file is not actually encrypted, just skip decryption
+					if (file_contains_sqlite_header) {
+						return SQLITE_OK;
+					}
 				}
 				RETURN_IF_NOT_OK(fill_page_number(p, iAmt, iOfst, IoOp::Read));
 				assert(page_size > 0 && "FIXME: page size was not read yet");
